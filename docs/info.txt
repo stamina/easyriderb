@@ -1,0 +1,729 @@
+*info.txt* easyrider rev B
+" vim: filetype=help foldmethod=marker foldmarker=<<<,>>> modifiable noreadonly tw=0
+" Author: Bas Brugman
+" Website: www.visionnaire.nl
+
+EasyRider REV B
+---------------
+
+General functionality
+---------------------
+
+Steps for firmware setup new boards:
+
+  1. Set correct fuses via avr.txt
+  2. remove HALT bit from RTC register: run ds1307_start_osc() once from init
+  3. setup GPS (default baudrate is 9600 -> setting to 56700):
+     3 uart strings with baud rate, 10hz and binary msg only
+     -> Paste them from setup.h into mcu2 .c file
+  4. setup WIFI via UART commands:
+     Default baudrate is 9600, change this after initial setup to 57600
+     Firmware update to 4.41, see below
+     -> Serial setup of Wifly is done by the cutecom or moserial terminal program.
+     -> Paste the pass-through UART code from setup.h into mcu1 .c file
+
+Communication
+-------------
+
+[X] SPI bus (for MCU intercommunication and microSD card reading/writing):
+
+  System Commands API (SPI Intercommunication between mcu's to exchange data)
+
+  SPI Intercommunication conditions and command logic:
+
+  SPI speed: fosc/4 (20 Mhz) -> 5 Mhz
+
+  MCU intercommunication time per byte is: 32 (8 bits*4 prescaler) cycles + 2 gap cycles + 5us delay added per byte ->
+
+  6.7us per byte -> 145 Kbyte/sec throughput
+
+  Per second througput needed:
+
+  mcu1 IN buffer:
+    10x ~96 bytes GPS
+    10x ~44 bytes DATA
+        ~49 bytes other triggered cmds
+
+  mcu2 IN buffer:
+    10x ~29 bytes STATS
+       ~119 bytes other triggered cmds
+
+  Feedback / Flow Control / Queueing system:
+
+  OnChange triggered commands have higher priority than Timed command triggers, so they stop/flush the current out cmds buffers and take
+  over the communication buffers.
+
+  SPI Flow between both mcu's and WiFi module:
+
+app     <--------[ wifi or serial (uart0/1 from mcu1 ]---------->    mcu1      <----------[ SPI ]------------->    mcu2
+=======================================================================================================================
+                                                                            state change trigger <---  CMD_STATE  ('a')
+                                <--- mcu1 response <--- CMD_STATE ('a')
+  ---------------------------------------------------------------------------------------------------------------------
+                                                                        periodic trigger <---  CMD_STATS ('b') (10 t/s)
+                                                          mcu 1 response ---> CMD_STATS ('b')
+  ---------------------------------------------------------------------------------------------------------------------
+                                                                         periodic trigger <---  CMD_DATA ('c') (10 t/s)
+                                <--- mcu1 response  <--- CMD_DATA ('c')
+  ---------------------------------------------------------------------------------------------------------------------
+                                                                          periodic trigger <---  CMD_GPS ('d') (10 t/s)
+                                 <--- mcu1 response  <--- CMD_GPS ('d')
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_RTC ('e')
+                                                           CMD_RTC ('e') ---> on response ---> 
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_SENSE ('f')
+                                                           CMD_SENSE ('f') --> on response ---> 
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_SETTINGS ('g')
+                                                           CMD_SETTINGS ('g') --> on response ---> 
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_LOG ('h')
+                                                           CMD_LOG ('h') --> on response ---> 
+                                                                                     <----- on response  CMD_LOG ('h')
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_REBOOT ('i')
+                                                           CMD_REBOOT ('i') --> on response ---> 
+  ---------------------------------------------------------------------------------------------------------------------
+                  --->   on app trigger ---> CMD_PINCODE ('j')
+                                                           CMD_PINCODE ('j') --> on response ---> 
+  ---------------------------------------------------------------------------------------------------------------------
+                                                                                         trigger <---  CMD_SOUND ('k')
+                  --->   on app trigger ---> CMD_SOUND ('k')
+                                                          mcu 1 handler ('k')
+  ---------------------------------------------------------------------------------------------------------------------
+                                                                                            trigger <---  CMD_MSG ('l')
+                                                           response ('l')
+  ---------------------------------------------------------------------------------------------------------------------
+
+  [X] MCU2 is master, MCU1 is slave
+    [X] FIX: SS on mcu2 is a input GPIO: SI_LI (left indicator psense) -> ignore EV_LI_ON/EV_LI_OFF during each SPI transfer,
+        since SS must be temporarily set as an output(low), then output(high) to not interfere with the hardware SPI
+  [X] SPI communication queuing algorithm
+      SPI tips: -> http://rpc.gehennom.org/2013/09/atmega2560-as-an-spi-slave/
+  [X] SPI commands' payload bytes always have to be in ascii format
+  [ ] Command info: 
+
+      Package: CMD_START - CMD_CODE - PAYLOAD BYTES (ASCII) - CMD_STOP
+
+      All OUTGOING commands contain a fixed timestamp: [Dddmmyyhhmmssmmm] prepended to the payload data
+
+      [X] command name:               CMD_STATE
+          command code:               'a'
+          payload:                    [Dddmmyyhhmmssmmm] + high_state_byte + low_state_byte as ascii string: 00000000.00000000
+          period:                     state change trigger
+          info:                       notify mcu1 of every state change and transfer the full new state
+          direction:                  mcu2 -> mcu1 -> app
+          examples:                   Dddmmyyhhmmssmmm00000000.00001010
+
+      [X] command name:               CMD_STATS
+          command code:               'b'
+          payload:                    none for mcu2 polling, 28 stats ascii bytes for mcu1 as return
+                                      [xxxyyyzzzCCCCVVVVVTTTTRRRRRG]
+                                      xyz accelerometer, current, voltage, temperature, rpm and gear
+          period:                     10 times/sec
+          info:                       general polling for mcu1 commands (gear and statistics), since mcu2 is the master who can only initiate the communication 
+          direction:                  mcu2 -> mcu1 / mcu1 -> mcu2
+          examples:                   3403701080250119954214000001
+
+      [X] command name:               CMD_DATA
+          command code:               'c'
+          payload:                    [Dddmmyyhhmmssmmm] + 28 stats ascii byte of sxyz accel/current/voltage/temp/rpm/gear data
+          period:                     10 times/sec
+          info:                       sending all sensor data values
+          direction:                  mcu2 -> mcu1 -> app
+          examples:                   Dddmmyyhhmmssmmm3403701080250119954214000001
+
+      [ ] command name: gps
+          command code: 'd'
+          payload:       comma separated variable-length string of GPS information
+          period:       periodically triggered by mcu2, 10 times/sec interval (10hz GPS module output)
+          info:         sending of GPS data
+          direction:    mcu2 -> mcu1 -> app
+
+      [ ] command name: rtc
+          command code: 0x85
+          payload:      new timestamp 16 bytes
+          period:       triggered by app
+          info:         set the new current date/time for the RTC chip
+          direction:    mcu1 -> mcu2
+
+      [ ] command name: CMD_SENSE
+          command code: 0x86
+          payload:      3 bytes representing the 16bit d_sense_status/p_sense_status/d_sense_active values
+          period:       triggered by app
+          info:         These 3 bytes basically change the values at runtime. Default values are set in the EEPROM.
+                        d_sense_status and p_sense_status are exclusive, one or the other has to be toggled OFF (0x00). 
+          direction:    app -> mcu1 -> mcu2
+
+      [ ] command name: CMD_SETTINGS
+          command code: 'g'
+          payload:      empty params to fetch current EEPROM values | data to fill new EEPROM | pincode or supervisor pincode to reset to default
+          period:       triggered by app
+          info:         sending 8 data values
+          direction:    app -> mcu1 -> mcu2 / app <- mcu1 <- mcu2
+
+      [ ] command name: log
+          command code: 0x88
+          payload:       log day: ddMMYYYY
+          period:       triggered by app
+          info:         requests log records from the SD card from a certain day
+          direction:    app -> mcu1 -> mcu2 / app <- mcu1 <- mcu2
+
+      [ ] command name: reboot
+          command code: 0x89
+          payload:       none
+          period:       triggered by app
+          info:         Reboot command send to both mcu1/mcu2, lets the watchdog timer run out and reboot both chips
+          direction:    app -> mcu1 -> mcu2
+
+      [ ] command name: pincode
+          command code: 0x90
+          payload:       4 numbers
+          period:       triggered by app
+          info:         authentication of app, without the pincode nothing (no commands allowed) is sent over Wifi
+          direction:    app -> mcu1 -> mcu2
+
+      [X] command name:               CMD_SOUND
+          command code:               'k'
+          payload:                    1 byte [0-255] 0-252: index of song, 255: randomly picked sound,
+                                      254: no sound (SOUND_OFF), 253: monotone beep (SOUND_ON)
+          period:                     triggered by app
+          info:                       plays a little song or beep
+          direction:                  mcu2 -> mcu1 / app -> mcu1
+          examples:                   255
+
+      [ ] command name: CMD_MSG
+          command code: 'l'
+          payload:       0
+          period:       triggered by app
+          info:         General notifications sent from mcu1/mcu2, 3 levels: NOTICE/WARNING/ERROR
+          direction:    app -> mcu1 -> mcu2 / .....
+          examples:
+
+      [ ] command name: CMD_TEST
+          command code: 'm'
+          payload:       0
+          period:       triggered by app or sense
+          info:         POST (Power On Self Test)      
+                        Procedure to test EEPROM, etc.....
+          direction:    app -> mcu1 -> mcu2 / .....
+          examples:
+
+---------------------------------------------------------------------------------------------------------------------
+TODO's/BUGS before releasing firmware 1.0.0
+  [X] timestamp update niet -> check mcu2 update code
+  [X] ACTIVE/SLEEP states keep toggling when activating IGN_SENSE, cause:
+      -> physical senses fire an ON event and dynamic senses immediately fire an OFF event
+      fix: set d_senses_active 0 by default and disable p_senses_active when toggling on d_senses_active and vice versa.
+      Toggling these senses is the responsibility of the "blackadder" app.
+  [X] CMD_STATE is not getting through to mcu1?!
+      cause: BUSY flag flushes the out_payloads by consecutive calls, before its being send
+      fix: remove reset_out(), not needed since the data in the out_buffer is send fast enough to overload
+  [X] after settle, some lights are not getting on again
+      cause: states are set first, then when the settle runs out, it turns all lights off again with all_relays()
+      fix: remove SETTLE functionality, since its obsolete, self-check is an APP feature
+  [X] MCU2 stats_handler -> should save stats, like g_gear for neutral light check and accelerometer values for alarm
+  [X] BUG: buzzer doesnt produce sounds, found a conflict with RPM pin T0 external timer
+      PB3 of buzzer has the OC0A functionality turned on, which overwrites are frequencies pushed on that pin
+      fix: disable OC0A on the PB3 pin
+  [ ] no GPS binary chars, after fix -> debug venus.c 
+  [ ] braking hard (read accelerometer) -> hazard light mode on (brake+flashing knipperbollen)
+    -> EXPERIMENT byte opnemen in Settings rom -> 8 bits als flag hiervoor gebruiken
+  [ ] Add extra song (convert ruby script to python, use MIDICSV) -> HOTRS/The Animals.
+    -> midi2byte.rb and midi2byte.py
+    -> http://www.fourmilab.ch/webtools/midicsv/ 
+---------------------------------------------------------------------------------------------------------------------
+[X] Test "stats", measure all ADC conversions and make possible corrections
+[X] Extra util.c/.h toevoegen, voor global converter functies zoals "byte to binary ascii", "0-left-padding", ...
+[X] General Settings in EEPROM:
+    -> Default settings in FLASH
+    -> data validation when doing EEPROM reads/writes -> checking for valid "easyrider" string
+[ ] Physical Senses/Dynamic Senses functionality
+    [ ] enable/disable functionality for:
+      -> g_p_senses_active (firmware flags to allow/disallow senses)
+      -> g_d_senses_active (client app flags to allow/disallow senses)
+      -> g_d_senses_status (client app flags to (de-)activate senses)
+[X] Migrate websocket.c/h to raw byte streams -> wifi.c/h
+[ ] UART1 commandline terminal prompt (on MCU1 only)
+   [ ] rewrite command_usart.c/h -> terminal.c/h
+   [ ] ability to launch all commands as a "fallback mode" in case Wifi communication fails
+   [ ] small help menu containing all commands and some examples
+      -> menu accessible with ?, help and ENTER key
+[X] Sound system (Speaker beeps):
+      mcu2 triggers and sends the CMD_SOUND to mcu1
+      mcu1 plays or mutes the sound over the speaker
+      e.g. in ST_SLEEP mode, all sounds will be muted, IGN_ON event fires a startup sound.
+      Settings.startup_sound defaults:
+      255: randomly picked sound
+      254: no sound (SOUND_OFF)
+      253: monotone beep (SOUND_ON)
+      [0-252] index of music array to play song
+[ ] MicroSD card FatFS library implementation (see thread: http://www.avrfreaks.net/forum/tut-c-getting-sdmmc-card-working-painlessly-fatfs?page=all)
+  [ ] Logging to microSD card, FAT32 code library -> SDHC card compatibility
+    -> Log filenames follow the format: ddmmyyyy.[bootup number] -> example "23122015.001"
+    -> After succesful transfer, delete file (don't exceed file limit in root dir of SD card)
+    -> log every command, in timestamp + data format
+  [ ] All possible logfile rows with example data:
+      CMD_STATE       'a' 
+      CMD_STATS       'b' 
+      CMD_DATA        'c' 
+      CMD_GPS         'd' 
+      CMD_RTC         'e' 
+      CMD_SENSE       'f' 
+      CMD_SETTINGS    'g' 
+      CMD_LOG         'h' 
+      CMD_REBOOT      'i' 
+      CMD_PINCODE     'j' 
+      CMD_SOUND       'k' 
+      CMD_MSG         'l' 
+[ ] Change alarm algorithm:
+    1. Alarm SENSE (toggle switch) keeps triggering ALARM_OFF/ON events
+    [ ] Ignition toggle will set the actual ALARM on/off mode
+    [ ] Alarm accelerometer values are saved after x secs and the alarm will be ready to be triggered
+[X] Check all states/transitions and do some cleanup
+  [X] removing unnecessary states like ST_ALARM_SET/ST_SETTLE/ST_CONNECTED/ST_LOG
+  [X] rename ST_IDLE to ST_ACTIVE
+  [X] create state-transition diagram
+  [X] All possible states/substates :
+    ST_SLEEP (Mutally Exclusive with ST_ALARM/ST_ACTIVE, main state)
+    ST_ACTIVE (Mutally Exclusive with ST_ALARM/ST_SLEEP, main state)        
+    ST_ALARM (Mutally Exclusive with ST_ACTIVE/ST_SLEEP, main state)        
+    ST_ALARM_SET
+    ST_NEUTRAL
+    ST_RI (Mutually Exclusive with ST_LI)
+    ST_LI (Mutually Exclusive with ST_RI)
+    ST_CLAXON
+    ST_BRAKE
+    ST_LIGHT
+    ST_WARNING
+    ST_PILOT
+[X] ST_NEUTRAL instead of ST_DEEP_SLEEP -> status light ON/OFF
+[X] Debug info/traces over UART1's
+[X] Timestamp format and functionality: [Dddmmyyhhmmssmmm] (D stands for day number: 1-7)
+    2 separate clocks used: RTC + internal MCU millisecond timer -> 25hz RTC polling, millisecond timer is reset per RTC Second change.
+[X] Uitlezen RTC via I2C (revB hardware limitation: no sync pulse connected to reset ms timer, evertime a second rolls over):
+    -> event occurred -> read RTC, seconds accuracy -> add separate ms timer (3 digits) -> dd-mm-yyyy hh:mm:ss mmm
+[X] Current-sensor: ACS714ELCTR-05B-T 5V/5A -> zie https://www.sparkfun.com/products/8883 voor opamp gain en tips
+    -> Readout info: 3 part series: https://www.youtube.com/watch?v=UF5jrnXvTlM
+[X] External changes :
+    [X] Ophanging/Scheiding draadboom -> niet te dicht bij bobine
+    [X] Snubber voor claxon op aparte
+      -> 1x flyback diode (snubber) parallel across claxon: SB540E SCHOTTKY 40V 5A
+    [X] 1x 10 ohm 5 watt resistor for rear light dimming
+    [X] 3D Case/Behuizing ontwerpen in Blender voor 3D printing shapeways.com:
+      PCB binnenmaten/boardmaat zonder marge: 75.16mm x 120.17mm x 20mm(van top tot bottom highest component) (wxlxh)
+      buitenmaten restricties:  26mm-27mm maximale hoogte
+      -> Export .step file from Altium -> convert to .x3d file with http://www.cadexchanger.com -> import into Blender 
+    [X] mini-fan integreren in behuizing -> Sunon mini-fan Sunon 20 mm - 5 V Fan - Brand New - Low S/H - KDE0501 KDE0501PDB3-8
+[X] Molex 24pin angled connector
+    -> Vin/GND als eerste 
+[X] Battery backup for RTC -> cr1225
+[X] Headers for wifi/gps breakouts
+[X] USART TXB0104 levelshifter tussen AVR en SD card -> SPI
+[X] Logo's voor breakouts -> AVRISP, WIFI, GPS en ACCEL. (Ook x/y/z arrow vermelden)
+[X] RPM meten vanaf pulse van hall sensor op vliegwiel:
+    -> rectifier diode + voltage divider + opamp buffer + optocoupler
+    -> falling edge counter, welke pin? INT0?
+    -> Engine RPM counter: http://www.avrfreaks.net/index.php?name=PNphpBB2&file=printview&t=43519&start=0
+    [X] BUG: rpm value reset niet naar 0, wanneer de motor uitgaat
+[X] Vergroten range van accu ADC -> 10v tot 15v -> naar 10bit ADC -> 1/3 voltage divider: 2.2k/1k
+[X] Wifly module setup
+    LED information ->
+      D1: green slow blink (module active)
+      D2: orange fast blinking (data send out)
+      D3: 
+    -> Config example: http://www.curiousmarc.com/dome-automation/building-marcduino-boards/setting-up-the-wifly-radio
+    [X] Update firmware from 2.32 to 4.41 via these UART commands:
+      $$$                                               [re-enter command mode, NOTE: send no <CR> for this one only]
+      set wlan join 1                                   [join WiFi from ssid and passphrase]
+      set wlan ssid    Your-Home-Wifi-SSID-Here         [your home Wifi networkname]
+      set wlan phrase Your-Home-Wifi-Password-Here      [you password, probably WPA2 security]
+      set ip dhcp 1                                     [get ip address from dhcp server]
+      set ftp address 198.175.253.161                   [new ftp address of the update server ftp://rn.microchip.com/public/]
+      set ftp dir public                                [download dir, default should be OK]
+      set ftp user roving                               [ftp user name, default should be OK]
+      set ftp pass Pass123                              [ftp password, default should be OK]
+      save
+      reboot
+      $$$
+      ftp update wifly7-441.img                         [specifically downloads 4.41]
+      reboot
+      $$$
+      factory R                                         [so it does not complain about a "CFG-ERR" or bad config]
+      save
+      reboot
+    [X] Wifly SoftAP mode setup via these UART commands:
+      set wlan join 7                    [enables Access Point mode -> soft AP mode]
+      set ip dhcp 4                      [enables DHCP server]
+      set ip address 192.168.2.1         [or choose any other IP address]
+      set ip gateway 192.168.2.1         [for Mobile Phone/Laptop to connect to, gateway needs to be the same as the IP address]
+      set ip netmask 255.255.255.0       [netmask ip]
+      set apmode ssid easyrider#         [or any other name you choose for you R2 Wifi network]
+      set apmode pass password           [set your WiFi password/passphrase(WPA2–PSK) here, needs to be at least 8 characters long, max 32]
+      set wlan rate 0                    [throttle down speed for longest reach 0=1Mbit/sec, default is 12=24Mbit/sec]
+      set wlan channel 3                 [or any 2.4GHz channel number you like, I think there are 7]
+      set apmode link_monitor 0          [disables auto deauthentication of clients, default is 3600]
+      save
+      reboot 
+    [X] Extra commands:
+      set uart baud 57600                [change baudrate of tx/rx pins]
+      set comm remote 0                  [don't send a default TCP '*HELLO*' when opening a tcp connection]
+      set comm open 0                    [don't send a default UART '*OPEN*' when opening a tcp connection]
+      set comm close 0                   [don't send a default UART '*CLOSE*' when closing a tcp connection]
+      get wlan                           [show wlan settings]
+      get everything                     [show all settings]
+Wifi Wifly info:
+  Soft AP Mode -> "The module runs a DHCP server and issues IP addresses to seven clients"
+
+  Normal mode msg should be something like this:
+  **********************************************
+          *READY*
+
+          Using WPA2-PSK
+          AP mode as easyrider2 on chan 3
+          Listen on 2000
+
+          DHCP Server Init
+  **********************************************
+
+  Command mode is entered with $$$, no CR or LF! Commands need a CR though.
+
+[X] UART communication:
+          AVR <-> FTDI cable <-> Terminal (Serial Terminal 57600 8N1)
+          AVR <-> WIFI module <-> Terminal (Telnet to port 2000, tcp/ip)
+[X] "websocket" text frames pushed via UART0 to Wifly's TCP/IP stack
+  Websockets information and examples:
+    -> RFC: http://tools.ietf.org/html/rfc6455
+    -> Some good general explanation: http://lucumr.pocoo.org/2012/9/24/websockets-101/
+    -> http://jlectronique.org/WebsocketsEN.htm
+    -> https://github.com/ejeklint/ArduinoWebsocketServer
+    e> https://github.com/m8rge/cwebsocket
+    [X] Websocket frames: Payload data altijd tussen 0-125 bytes houden
+[X] GPS coordinates
+     -> GPS Venus module via mcu2 UART0
+     -> configure via binary command set to send uart_put commands (decimals) in a row (save to gps' internal flash):
+[X] BUG: Minor tweak to CTC timer values to correspond to the correct formula: CTC # = (required delay in sec)/(clock time period in sec)-1 
+[X] BUG: Claxon mosfet switched aan bij veel toeren, voor zeer korte tijd -> oscillation?
+      -> FIXED: Gemeten met scope: elke keer precies 15ms gate trigger, dus physical sense (drukknop claxon) maakt
+         contact -> vergroten van 3x 5ms "debouncing" algoritme in code naar 6x NOTE: this was the final fix!
+      -> duikt de 12V op gate naar beneden? waarom?
+      -> Cap ervoor zetten?
+      -> Grotere input cap bij 12V Regulator -> 1000uf, niet te hoge dimensie
+      -> Transistor base resistor van 10K naar 2200 ohm?
+      -> Cooler verwijderen: te veel capacitance?
+      -> extra flyback diode (schottky) parallel aan mosfet? 
+[X] BUG: The claxon sound continues when turning the alarm off by turning the ignition key on 
+[X] TODO: Alarm mode: indicator blink slower -> every 4 timer1 ticks: 1 tick on 
+[X] TODO: Alarm trigger time should be faster, 
+[X] BUG: Ignition off: disable all lights/sounds
+[X] BUG: Cockpit status light stays lit in alarm/alarmsettle mode ->  unwanted check_battery_read() calls
+[X] BUG: Hardware related:  when claxon (2 amp) is pushed, all reed relays switch on: short blinks of lights
+      -> snubber/flyback diode proberen
+      -> Ground path van claxon terugvoeren via draad naar accu min-pole om groundloops te voorkomen
+[X] BUG: Alarm trigger werkt niet lekker: claxon/blinkers sequence niet goed en transition from alarm_settle/alarm states foutief
+- [X] Lighting System
+- [X] Audio through Claxon and Buzzer
+- [X] Battery status
+- [X] Alarm, triggered by an accelerometer
+
+- General functionality:
+  [X] State Machine rules "exclusive"/"inclusive"
+      [X] positive and negative substates parsing
+      [X] sense reading moet uit te zetten zijn: enableSense/disableSense
+      [X] event dispatching via psense reads, maar ook via dynamic senses (dyn_senses)
+  [X] JTD uitzetten, zodat de poorten normaal gebruikt kunnen worden ->
+       An IO control bit "JTD" is available. Unlike the fuses this bit can be
+       set at run-time allowing you to disable the JTAG / OCD functionality in software
+       during program execution.
+  [X] Watchdog aanzetten, tegen vastlopers!
+  [X] In production: OCD uitzetten ivm extra stroomverbruik
+
+- Audio
+  [X] Simple music via buzzer (Midi to CSV to .h binary conversion)
+
+ [X] Claxon
+  [X] Sound on Push button
+
+ - Battery status
+    [X] knipper status light cockpit:
+      [X] normal operation -> continue branden
+      [X] shutdown via switch -> uit
+      [X] indien low battery -> slow knipper
+      [X] indien high battery -> fast knipper
+
+ - Alarm, triggered by an accelerometer
+    [X] bij aanzetten -> 1x indicators aan voor x secs -> alarm settle time -> buzzer music
+    [X] in active mode: cockpit indicator lamp knippert
+    [X] Alarm triggered: alle lichten blinken, claxon repeat
+    [X] Alarm triggered: na x secs -> reset -> accelerometer slaat nieuwe voltage waarden op
+
+ - Light/Buzzer System
+    [X] Indicators Left/Right
+      [X] Buzzer mee laten piepen (software flag)
+    [X] Rearlight
+    [X] Brakelight
+    [X] Pilotlight
+    [X] Warning lights: 4x knipperbollen blinken en buzzer
+
+- Contact slot:
+  Ignition uit: sense wire (SENSE_IGN) -> contact uit
+    [X] naar ST_SLEEP mode
+    [X] Na x secs naar mcu hardware sleep mode
+      -> uitzetten van ADC, Watchdog en ports
+      -> geen wakeup trigger, alleen een harde reset
+  Ignition aan: sense wire (~SENSE_IGN) -> contact aan:
+    [X] Alle lampen een paar seconden aan
+    [X] startup sound / kleine muziekje
+    [X] status wordt ST_NORMAL
+
+- Shell Commands:
+    [X] help -> show help menu / service menu
+    [X] show
+        [X] version
+        [X] state (all substates / physical and dynamic senses)
+        [X] volt (accu voltage / 3-axis voltages accelerometer)
+        [X] conf (EEPROM struct, toon alle tSettings tegelijk):
+    [X] set 
+        [X] dynamic senses
+        [X] conf (settings in EEPROM struct)
+    [X] reset (software reset mcu via watchdog)
+
+GPS module
+----------
+
+Aansturing gaat via UART0 van mcu2, zie pdf voor alle commando's.
+Gebruikmakend van de binary output message. Disabled all NMEA string messages.
+
+Functies van https://code.google.com/p/multiwii/source/browse/branches/guru_florida/2.4/MultiWii_shared/Venus.cpp?r=1767
+bekijken en implementeren in seperate lib venus.c/venus.h
+
+Huidige firmware response:
+
+$SkyTraq,Venus6
+$Kernel,v1.6.10,00030ED
+E,16324205,F,16.367667MHz
+$ver,011023,rev,120710
+
+Configuration C-code:
+
+// 57600 baud
+uart_put_0(160);
+uart_put_0(161);
+uart_put_0(0x00);
+uart_put_0(0x04);
+uart_put_0(0x05);
+uart_put_0(0x00);
+uart_put_0(0x04);
+uart_put_0(0x01);
+uart_put_0(0x00);
+uart_put_0(13);
+uart_put_0(10);
+
+// Binary only output
+uart_put_0(160);
+uart_put_0(161);
+uart_put_0(0x00);
+uart_put_0(0x03);
+uart_put_0(0x09);
+uart_put_0(0x02);
+uart_put_0(0x01);
+uart_put_0(10);
+uart_put_0(13);
+uart_put_0(10);
+
+// 10 hz update rate
+uart_put_0(160);
+uart_put_0(161);      
+uart_put_0(0x00);
+uart_put_0(0x03);
+uart_put_0(14);
+uart_put_0(10);
+uart_put_0(0x01);
+uart_put_0(0x05);
+uart_put_0(13);
+uart_put_0(10);
+
+Some forum excerpt:
+
+"you need to supply the battery pin (with the same wire than 3.3V power supply, or with a battery !).
+To modify parameters, find attached a file I have built to summarise the different commands (in french, but easy to understand), and messages specif in pdf file.
+You will just have to send these data (provided in my file in decimal format).
+
+Be careful:
+- if you change values, you will have to change the checksum (Excusive OR of all data bytes (complete PAYLOAD))
+- if you change parameters in RAM, they will be resetted at the next turn on. But they will remain if you set them in flash.
+"
+
+Initialisation du port 3 à 9600 Bd
+
+======================================================== 
+
+Débit du port en RAM:
+4800	: 160 161 00 04 05 00 00 00 05 13 10
+9600	: 160 161 00 04 05 00 01 00 04 13 10	
+19200	: 160 161 00 04 05 00 02 00 07 13 10
+38400	: 160 161 00 04 05 00 03 00 06 13 10
+57600	: 160 161 00 04 05 00 04 00 01 13 10
+115200	: 160 161 00 04 05 00 05 00 00 13 10
+
+Débit du port en flash:
+4800	: 160 161 00 04 05 00 00 01 03 13 10
+9600	: 160 161 00 04 05 00 01 01 05 13 10
+19200	: 160 161 00 04 05 00 02 01 06 13 10
+38400	: 160 161 00 04 05 00 03 01 07 13 10
+57600	: 160 161 00 04 05 00 04 01 00 13 10
+115200	: 160 161 00 04 05 00 05 01 01 13 10
+
+========================================================
+
+Fréquence en RAM:
+ 1Hz	: 160 161 00 03 14 01 00 15 13 10
+ 2Hz	: 160 161 00 03 14 02 00 12 13 10
+ 4Hz	: 160 161 00 03 14 04 00 10 13 10 
+ 5Hz	: 160 161 00 03 14 05 00 11 13 10
+ 8Hz	: 160 161 00 03 14 08 00 06 13 10
+10Hz	: 160 161 00 03 14 10 00 04 13 10
+
+Fréquence, en flash:
+ 1Hz	: 160 161 00 03 14 01 01 14 13 10
+ 2Hz	: 160 161 00 03 14 02 01 13 13 10
+ 4Hz	: 160 161 00 03 14 04 01 11 13 10 
+ 5Hz	: 160 161 00 03 14 05 01 10 13 10
+ 8Hz	: 160 161 00 03 14 08 01 07 13 10
+10Hz	: 160 161 00 03 14 10 01 05 13 10    
+
+========================================================
+
+Activation du WAAS en RAM:
+ON	: 160 161 00 03 55 01 00 54 13 10
+OFF   	: 160 161 00 03 55 00 00 55 13 10
+
+Activation du WAAS en Flash:
+ON	: 160 161 00 03 55 01 01 55 13 10
+OFF   	: 160 161 00 03 55 00 01 54 13 10
+
+==========================================================
+
+Restart:
+Hot	: 160 161 00 15 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 13 10
+Warm	: 160 161 00 15 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 03 13 10 
+Cold	: 160 161 00 15 01 03 00 00 00 00 00 00 00 00 00 00 00 00 00 02 13 10
+Factory	: 160 161 00 02 04 01 05 13 10
+
+===========================================================
+
+Type de messages de sortie, en RAM:
+aucun	: 160 161 00 03 09 00 00 09 13 10
+NMEA	: 160 161 00 03 09 01 00 08 13 10
+Binary	: 160 161 00 03 09 02 00 11 13 10
+
+Type de messages de sortie, en Flash:
+aucun	: 160 161 00 03 09 00 01 08 13 10
+NMEA	: 160 161 00 03 09 01 01 09 13 10
+Binary	: 160 161 00 03 09 02 01 10 13 10
+
+Statistics
+----------
+
+Power Consumption
+-----------------
+
+(2.9Ah Gel battery)
+
+Power EasyRider Board REV B:
+  Normal mode:     xxx mA
+  Sleep mode:      xxx mA (pcb led brandt nog!)
+  Alarm mode:      xxx mA (indicator relay on/off)
+  Deep Sleep mode: xxx mA (mcu Power Down) -> accu leeg na xx dagen
+
+[X] PCB: purple solder mask and gold plating finish -> board house OSH Park in the US -> http://oshpark.com/
+
+Altium Schematic/Board
+----------------------
+
+Used Altium version: 13.2.5 (2013)
+
+General
+-------
+
+CTRL(-Shift)-TAB	Switch between open documents (tabs like schematic/pcb)
+
+PCB Library
+-----------
+
+"Force Annotate", "Update from Libraries"
+
+D-U		Update PCB with schematic changes
+CTRL-M 		Measure distance between 2 points
+
+Schematic 
+---------
+
+T, O		Search Library
+V, D		View - Document Fit
+V, F		View - Fit
+
+
+PCB Editor
+----------
+
+"Update from PCB Libraries", "Rules" and finally "DRC" (Design Rule Checks)
+
+Z, B		Zoom overview complete board
+O, D	  View Configurations
+O, L		Layer Configuration
+(CTRL)-Q	Toggle metric/imperial
+CTRL-G		Change current grid values
+Shift-R		Change routing of track (ignore obstacles, around..)
+V,B / 0, 9	Flip/Rotate board in 3D
+N,S,A / N,S,O	Show ratnests all/selected
+H,S,A / H,S,O	Hide ratnests all/selected 
+Shift-S / + -	Toggle to single layer / walk through layers
+CTRL-PrintScr	Screenshots
+X and Y and L	Press while moving component to flip hor/ver and to other side of board
+
+OSH Park Design Rules
+---------------------
+
+6 mil minimum trace width
+6 mil minimum spacing
+at least 15 mil clearances from traces to the edge of the board
+13 mil minimum drill size
+7 mil minimum annular ring
+
+Logo's: 2de script optie van Altium wiki gebruiken, menu optie: DXP -> run script
+
+Board cutouts/slots: they use a 0.1inch bit (so your minimum slot width is 0.1inch)
+
+    boardname.GTL Top Layer
+    boardname.GBL Bottom Layer
+    boardname.GTS Top Soldermask
+    boardname.GBS Bottom Soldermask
+    boardname.GTO Top Silkscreen
+    boardname.GBO Bottom Silkscreen
+    boardname.GKO Board Outline
+    boardname.G2L only if you're uploading a four layer board
+    boardname.G3L only if you're uploading a four layer board
+    boardname.XLN Drills
+
+Keep out layer -> Design -> Board shape -> draw primitives on Keep Out layer, 6mil lines
+File -> Fabrication Outputs -> Gerber files, select inch en 2:4, Advanced: absolute coordinates, keep zero's (belangrijk omdat de drill-file ook absolute is)
+Check layers
+Export -> Gerber, selecteer hier ook 2:4
+
+Drills: 
+
+Our service does not use Altium's Drill Drawing (DD1) or Drill Guide (GG1) files. We require that you produce the drill file in NC Drills format. 
+Altium has published a guide on producing those files here:
+http://wiki.altium.com/display/ADOH/NC+Drill+Output+Options
+
+We require a 2:4 format when using Inches, or a 3:3 when using Millimeters.
+Check "Keep Leading And Trailing Zeroes" and "Reference to absolute origin".
+Uncheck "Generate Seperate NC Drill files", "Use Drilled Slot Command", and "Generate Board Edge Route Paths".
+"Optimize Change Location Commands" doesn't matter, as we will recalculate drill movement.
+
+Export -> Save Drill, hier ook 2:4, none en absolute selecteren
+
+
+EOF

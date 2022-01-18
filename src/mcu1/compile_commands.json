@@ -1,0 +1,33 @@
+[
+  {
+    "arguments": [
+      "/usr/sbin/avr-gcc",
+      "-c",
+      "-mmcu=atmega1284p",
+      "-I.",
+      "-D",
+      "EASYRIDER_MCU1",
+      "-D",
+      "EASY_TRACE",
+      "-gdwarf-2",
+      "-DF_CPU=20000000UL",
+      "-O3",
+      "-funsigned-char",
+      "-funsigned-bitfields",
+      "-ffunction-sections",
+      "-fpack-struct",
+      "-fshort-enums",
+      "-Wall",
+      "-Wstrict-prototypes",
+      "-Wa,-adhlns=./easyrider_mcu1.lst",
+      "-I../",
+      "-std=gnu99",
+      "-o",
+      "easyrider_mcu1.o",
+      "easyrider_mcu1.c"
+    ],
+    "directory": "/home/stamina/Projects/easyriderb/src/mcu1",
+    "file": "/home/stamina/Projects/easyriderb/src/mcu1/easyrider_mcu1.c",
+    "output": "/home/stamina/Projects/easyriderb/src/mcu1/easyrider_mcu1.o"
+  }
+]
